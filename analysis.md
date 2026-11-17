@@ -1,0 +1,406 @@
+Mortality Modelling and Life Table Construction in R
+================
+Hemant Pareek
+
+- [1. Question](#1-question)
+- [2. Data](#2-data)
+- [3. Fitting the mortality laws by maximum
+  likelihood](#3-fitting-the-mortality-laws-by-maximum-likelihood)
+- [4. Graduation tests](#4-graduation-tests)
+- [5. Life table](#5-life-table)
+- [6. Pricing life insurance
+  products](#6-pricing-life-insurance-products)
+- [7. Limitations and next steps](#7-limitations-and-next-steps)
+- [Reproducibility](#reproducibility)
+
+## 1. Question
+
+Life insurers and pension schemes price their products from a **life
+table**, which gives for each age the probability of dying within the
+next year. This project builds one from raw data, end to end:
+
+1.  Estimate mortality rates from **deaths and exposure** data.
+2.  Fit the classic **Gompertz** and **Makeham** mortality laws by
+    **maximum likelihood**, coded by hand.
+3.  Check the fit with the standard **graduation tests**.
+4.  Build a **life table** and use it to price an **annuity** and a
+    **term assurance** policy.
+
+## 2. Data
+
+Real deaths and exposure data for **England & Wales males**, from the
+[Human Mortality Database](https://www.mortality.org) (as packaged in
+the R package `StMoMo`). The model is fitted to calendar year **2011,
+ages 40–95**, the adult ages where the Gompertz pattern usually holds
+and the data are plentiful.
+
+- $D_x$ = number of deaths at age $x$ last birthday
+- $E_x$ = **central exposure**: person-years lived at age $x$ (mid-year
+  population estimate)
+- Crude death rate: $\hat m_x = D_x / E_x$
+
+``` r
+e <- new.env()
+data("EWMaleData", package = "StMoMo", envir = e)
+ew <- unclass(e$EWMaleData)
+
+ages <- 40:95
+D <- ew$Dxt[as.character(ages), "2011"]
+E <- ew$Ext[as.character(ages), "2011"]
+crude <- D / E
+
+data.frame(ages = "40-95", deaths = sum(D), exposure_person_years = round(sum(E)),
+           crude_rate_age_40 = signif(crude[1], 3), crude_rate_age_95 = signif(crude[length(crude)], 3))
+```
+
+    ##     ages deaths exposure_person_years crude_rate_age_40 crude_rate_age_95
+    ## 40 40-95 221159              13213079           0.00147             0.286
+
+``` r
+ggplot(data.frame(age = ages, rate = crude), aes(age, rate)) +
+  geom_point(colour = navy) +
+  scale_y_log10(labels = label_number(accuracy = 0.0001)) +
+  labs(title = "Crude death rates, England & Wales males, 2011",
+       subtitle = "Log scale: a near-straight line is the Gompertz pattern",
+       x = "Age", y = "Deaths per person-year (log scale)")
+```
+
+![](figures/crude-plot-1.png)<!-- -->
+
+On a log scale the rates fall close to a straight line: mortality rises
+roughly **exponentially with age**, about 9–10% more per year of age.
+That observation is the Gompertz law.
+
+## 3. Fitting the mortality laws by maximum likelihood
+
+### The likelihood
+
+Assume deaths at each age follow a Poisson distribution, with mean equal
+to exposure × force of mortality:
+
+$$D_x \sim \text{Poisson}(E_x\,\mu_x) \quad\Rightarrow\quad
+\log L = \sum_x \big[ D_x \log(E_x\mu_x) - E_x\mu_x - \log D_x! \big]$$
+
+Two laws for $\mu_x$:
+
+| Law | Force of mortality | Interpretation |
+|----|----|----|
+| Gompertz | $\mu_x = B\,c^x$ | Ageing: mortality rises exponentially |
+| Makeham | $\mu_x = A + B\,c^x$ | Adds a constant $A$ for deaths unrelated to age (accidents etc.) |
+
+The negative log-likelihood is minimised with `optim()`. **Standard
+errors** come from the inverse of the Hessian (the observed information
+matrix). See [`R/mortality_functions.R`](R/mortality_functions.R).
+
+``` r
+gomp <- fit_law(mu_gompertz, start = c(-10, 0.1),             x = ages, D = D, E = E)
+make <- fit_law(mu_makeham,  start = c(log(5e-4), -10, 0.1),  x = ages, D = D, E = E)
+
+params <- data.frame(
+  law       = c("Gompertz", "Gompertz", "Makeham", "Makeham", "Makeham"),
+  parameter = c("log B", "log c", "log A", "log B", "log c"),
+  estimate  = c(gomp$par, make$par),
+  std_error = c(gomp$se, make$se)
+)
+knitr::kable(params, digits = 5)
+```
+
+| law      | parameter |  estimate | std_error |
+|:---------|:----------|----------:|----------:|
+| Gompertz | log B     | -10.92132 |   0.01397 |
+| Gompertz | log c     |   0.10140 |   0.00018 |
+| Makeham  | log A     |  -7.03805 |   0.03439 |
+| Makeham  | log B     | -11.52362 |   0.02534 |
+| Makeham  | log c     |   0.10859 |   0.00031 |
+
+``` r
+cat(sprintf("Makeham: A = %.6f, B = %.3e, c = %.4f\n", exp(make$par[1]), exp(make$par[2]), exp(make$par[3])))
+```
+
+    ## Makeham: A = 0.000878, B = 9.894e-06, c = 1.1147
+
+### Cross-check against R’s built-in GLM
+
+$\log \mu_x = \log B + x\log c$ is linear in $x$, so the Gompertz fit is
+the same as a **Poisson GLM with a `log(E)` offset**. The hand-coded MLE
+should match `glm()` exactly:
+
+``` r
+g <- glm(D ~ ages, family = poisson, offset = log(E))
+rbind(hand_coded_MLE = gomp$par, glm = unname(coef(g)))
+```
+
+    ##                     [,1]      [,2]
+    ## hand_coded_MLE -10.92132 0.1013975
+    ## glm            -10.92132 0.1013975
+
+``` r
+cat("Largest absolute difference:", signif(max(abs(gomp$par - coef(g))), 2), "
+")
+```
+
+    ## Largest absolute difference: 4.1e-10
+
+### Which law fits better?
+
+``` r
+lrt <- 2 * (make$loglik - gomp$loglik)
+data.frame(law = c("Gompertz", "Makeham"), parameters = c(2, 3),
+           log_likelihood = round(c(gomp$loglik, make$loglik), 1),
+           AIC = round(c(gomp$aic, make$aic), 1))
+```
+
+    ##        law parameters log_likelihood    AIC
+    ## 1 Gompertz          2         -884.8 1773.6
+    ## 2  Makeham          3         -443.3  892.6
+
+``` r
+cat(sprintf("Likelihood-ratio test, Makeham vs Gompertz: %.1f on 1 df, p = %.2g\n",
+            lrt, pchisq(lrt, 1, lower.tail = FALSE)))
+```
+
+    ## Likelihood-ratio test, Makeham vs Gompertz: 883.0 on 1 df, p = 4.9e-194
+
+Makeham is clearly better: the extra constant $A$ captures deaths at
+younger adult ages that aren’t driven by ageing. **Makeham is used from
+here on.**
+
+``` r
+fit_df <- data.frame(age = ages, crude = crude,
+                     Gompertz = mu_gompertz(gomp$par, ages), Makeham = mu_makeham(make$par, ages))
+ggplot(fit_df, aes(age)) +
+  geom_point(aes(y = crude), colour = "grey45") +
+  geom_line(aes(y = Gompertz, colour = "Gompertz"), linewidth = 0.9) +
+  geom_line(aes(y = Makeham, colour = "Makeham"), linewidth = 0.9) +
+  scale_y_log10() +
+  scale_colour_manual(values = c(Gompertz = light, Makeham = navy)) +
+  labs(title = "Graduated vs crude mortality rates", subtitle = "Points = crude rates; lines = fitted laws",
+       x = "Age", y = "Force of mortality (log scale)", colour = NULL)
+```
+
+![](figures/fit-plot-1.png)<!-- -->
+
+## 4. Graduation tests
+
+Smoothing crude rates with a law is called **graduation**. Actuaries
+check a graduation for: \* **overall fit** (chi-square) \* **no single
+age badly wrong** (standardised deviations) \* **no overall bias**
+(signs test, cumulative deviations) \* **no long runs** where the law
+sits consistently above or below the data (grouping of signs)
+
+Standardised deviation at each age:
+$z_x = \dfrac{D_x - E_x\hat\mu_x}{\sqrt{E_x\hat\mu_x}} \approx N(0,1)$
+if the graduation is adequate.
+
+``` r
+mu_hat <- mu_makeham(make$par, ages)
+tests  <- grad_tests(D, E, mu_hat, n_par = 3)
+tests$result <- ifelse(tests$p_value < 0.05, "Fail", "Pass")
+knitr::kable(tests, digits = 4)
+```
+
+| test                                | statistic              | p_value | result |
+|:------------------------------------|:-----------------------|--------:|:-------|
+| Chi-square (overall fit)            | 336.2 on 53 df         |  0.0000 | Fail   |
+| Standardised deviations: \|z\| \> 2 | 27 of 56 (expect ~2.5) |  0.0000 | Fail   |
+| Signs test (positives)              | 30 of 56               |  0.6889 | Pass   |
+| Cumulative deviations               | z = 0.00               |  1.0000 | Pass   |
+| Grouping of signs (positive runs)   | 8 groups (expect 14.5) |  0.0007 | Fail   |
+
+``` r
+z <- (D - E * mu_hat) / sqrt(E * mu_hat)
+ggplot(data.frame(age = ages, z = z), aes(age, z, fill = z > 0)) +
+  geom_col() +
+  geom_hline(yintercept = c(-2, 2), linetype = "dashed", colour = "grey40") +
+  annotate("text", x = 91, y = 6.6, label = "age 91 = born 1920", size = 3.3, hjust = 0.8) +
+  annotate("text", x = 64.5, y = -4.0, label = "ages 64-65 = born 1947 / 1946", size = 3.3) +
+  scale_fill_manual(values = c(`TRUE` = navy, `FALSE` = light), guide = "none") +
+  labs(title = "Standardised deviations, Makeham graduation",
+       subtitle = "Dashed lines at ±2; long runs of the same sign show systematic misfit",
+       x = "Age", y = "z")
+```
+
+![](figures/z-plot-1.png)<!-- -->
+
+### Interpreting the failures
+
+The Makeham law captures the **overall shape** very well (cumulative
+deviations and the signs test pass, so there’s no overall bias), but it
+**fails the chi-square, individual standardised deviations and
+grouping-of-signs tests**. Two reasons:
+
+1.  **The law is too rigid for the detail in the data.** The deviations
+    come in long runs: negative in the 40s, positive from the 50s to the
+    early 60s, negative in the 70s, and positive again in the late 80s.
+    A three-parameter curve can’t follow those bends.
+2.  **Cohort effects.** The largest deviation is at **age 91, people
+    born in 1920**, the post-WWI birth spike. There is also a sharp jump
+    between **ages 64 and 65** (born 1947 vs 1946, the post-WWII baby
+    boom). Unusual birth cohorts are known to distort both mortality and
+    population (exposure) estimates. No smooth function of age can fit
+    them.
+
+### Why exposure size matters
+
+These are national data: over **200,000 deaths**. For a fixed *relative*
+misfit, $z_x$ grows with $\sqrt{E_x}$, so the chi-square statistic grows
+in proportion to exposure. Below, the same graduation is tested at the
+size of smaller portfolios (deaths and exposures scaled down, so the
+crude rates are unchanged):
+
+``` r
+scales_df <- do.call(rbind, lapply(c(1, 0.10, 0.01), function(s) {
+  t <- grad_tests(D * s, E * s, mu_hat, n_par = 3)
+  data.frame(portfolio = paste0(s * 100, "% of national data"), total_deaths = round(sum(D) * s),
+             chi_square = sub(" on.*", "", t$statistic[1]), p_value = signif(t$p_value[1], 3))
+}))
+knitr::kable(scales_df)
+```
+
+| portfolio             | total_deaths | chi_square | p_value |
+|:----------------------|-------------:|:-----------|--------:|
+| 100% of national data |       221159 | 336.2      |   0.000 |
+| 10% of national data  |        22116 | 33.6       |   0.983 |
+| 1% of national data   |         2212 | 3.4        |   1.000 |
+
+At the size of a typical life insurer’s experience (around 1% of
+national data, roughly 2,000 deaths), the same graduation **passes
+comfortably**. Takeaway: with very large data, a formal test will reject
+any simple law, so an actuary has to judge whether the deviations matter
+**financially**, not just statistically. A better fit at this scale
+would need a more flexible graduation, such as a spline or a
+higher-order Gompertz–Makeham formula.
+
+## 5. Life table
+
+The fitted Makeham law is used to extend the table **beyond the data to
+age 110**, where it is closed ($q_{110} = 1$). For these laws the
+one-year death probability has an exact formula:
+
+$$q_x = 1 - \exp\!\Big(-\!\int_x^{x+1}\mu_t\,dt\Big) = 1 - \exp\!\Big(-A - B c^x \tfrac{c-1}{\ln c}\Big)$$
+
+``` r
+lt <- life_table(make$par, ages = 40:110)
+knitr::kable(lt[lt$age %in% seq(40, 110, 10), ], digits = c(0, 5, 0, 0, 2), row.names = FALSE,
+             col.names = c("Age", "q_x", "l_x", "d_x", "e_x (complete, approx.)"))
+```
+
+| Age |     q_x |    l_x |  d_x | e_x (complete, approx.) |
+|----:|--------:|-------:|-----:|------------------------:|
+|  40 | 0.00168 | 100000 |  168 |                   39.93 |
+|  50 | 0.00326 |  97771 |  318 |                   30.72 |
+|  60 | 0.00791 |  93044 |  736 |                   21.99 |
+|  70 | 0.02156 |  81737 | 1762 |                   14.24 |
+|  80 | 0.06091 |  56651 | 3450 |                    8.09 |
+|  90 | 0.16842 |  19457 | 3277 |                    3.94 |
+| 100 | 0.41992 |    835 |  351 |                    1.68 |
+| 110 | 1.00000 |      0 |    0 |                    0.50 |
+
+``` r
+ggplot(lt, aes(age, lx)) +
+  geom_line(colour = navy, linewidth = 1) +
+  geom_vline(xintercept = 95, linetype = "dotted", colour = "grey40") +
+  annotate("text", x = 96, y = 90000, label = "beyond 95: extrapolated", hjust = 0, size = 3.3) +
+  scale_y_continuous(labels = comma) +
+  labs(title = "Survivors out of 100,000 men alive at age 40", x = "Age", y = expression(l[x]))
+```
+
+![](figures/survival-1.png)<!-- -->
+
+## 6. Pricing life insurance products
+
+Interest rate **4% a year**. No expenses or profit loading, so these are
+**net (pure) premiums**.
+
+- **Whole-life annuity-due** of 1 a year:
+  $\ddot a_x = \sum_{k\ge0} v^k\,{}_kp_x$
+- **20-year term assurance**, sum assured paid at the end of the year of
+  death:
+  $A^1_{x:\overline{20}|} = \sum_{k=0}^{19} v^{k+1}\,{}_kp_x\,q_{x+k}$
+- **Level annual premium** (equivalence principle: PV of premiums = PV
+  of benefits):
+  $P = S \cdot A^1_{x:\overline{20}|} \,/\, \ddot a_{x:\overline{20}|}$
+
+``` r
+i <- 0.04
+annuities <- data.frame(age = c(55, 60, 65, 70),
+                        annuity_due = sapply(c(55, 60, 65, 70), function(x) annuity_due(lt, x, i)))
+annuities$cost_of_10000_pa <- annuities$annuity_due * 10000
+knitr::kable(annuities, digits = c(0, 3, 0),
+             col.names = c("Age", "ä_x", "Cost of a pension of 10,000 a year"))
+```
+
+| Age |    ä_x | Cost of a pension of 10,000 a year |
+|----:|-------:|-----------------------------------:|
+|  55 | 16.139 |                             161386 |
+|  60 | 14.492 |                             144916 |
+|  65 | 12.697 |                             126965 |
+|  70 | 10.806 |                             108062 |
+
+``` r
+S <- 1e6
+lt30 <- life_table(make$par, ages = 30:110)   # starts at 30 so entry age 30 can be priced
+term <- data.frame(entry_age = c(30, 40, 50))
+term$single_premium <- sapply(term$entry_age, function(x) S * term_assurance(lt30, x, 20, i))
+term$annual_premium <- sapply(term$entry_age, function(x)
+  S * term_assurance(lt30, x, 20, i) / annuity_due(lt30, x, i, n = 20))
+knitr::kable(term, digits = 0, col.names = c("Entry age", "Single premium", "Level annual premium"),
+             caption = "20-year term assurance, sum assured 1,000,000")
+```
+
+| Entry age | Single premium | Level annual premium |
+|----------:|---------------:|---------------------:|
+|        30 |          22502 |                 1611 |
+|        40 |          42929 |                 3101 |
+|        50 |          99777 |                 7399 |
+
+20-year term assurance, sum assured 1,000,000
+
+> Ages 30–39 are below the fitted range (40–95), so the entry-age-30
+> figure relies on extrapolating the law downwards and is shown for
+> illustration only.
+
+### Sensitivity: how much does each assumption matter?
+
+``` r
+sens <- expand.grid(interest = c(0.03, 0.04, 0.05), mortality = c(0.9, 1.0, 1.1))
+sens$annuity_65 <- mapply(function(ii, ms) annuity_due(life_table(make$par, 40:110, mort_scale = ms), 65, ii),
+                          sens$interest, sens$mortality)
+tab <- reshape(sens, idvar = "interest", timevar = "mortality", direction = "wide")
+names(tab) <- c("Interest", "Mortality 90%", "Mortality 100%", "Mortality 110%")
+tab$Interest <- percent(tab$Interest)
+knitr::kable(tab, digits = 3, caption = "Annuity-due at age 65 under different assumptions")
+```
+
+| Interest | Mortality 90% | Mortality 100% | Mortality 110% |
+|:---------|--------------:|---------------:|---------------:|
+| 3%       |        14.258 |         13.819 |         13.421 |
+| 4%       |        13.064 |         12.697 |         12.361 |
+| 5%       |        12.036 |         11.726 |         11.441 |
+
+Annuity-due at age 65 under different assumptions
+
+A 1% fall in interest raises the annuity cost by noticeably more than
+10% lighter mortality does. This is why pension schemes and annuity
+writers watch interest rates and **longevity** so closely.
+
+## 7. Limitations and next steps
+
+- **Population, not insured lives.** People who buy insurance or
+  annuities usually live longer than the general population, and
+  recently underwritten lives have lower mortality (*select* vs
+  *ultimate*). In India, insurers use the **Indian Assured Lives
+  Mortality (IALM) 2012–14** table. Repeating this analysis against it
+  is a natural next step.
+- **One calendar year, no future improvements.** Real annuity pricing
+  adds mortality improvement projections, using models like Lee–Carter
+  or Cairns–Blake–Dowd, which `StMoMo` can fit.
+- **No expenses, profit or lapses**: these are net premiums only.
+
+## Reproducibility
+
+``` r
+sessionInfo()$R.version$version.string
+```
+
+    ## [1] "R version 4.6.1 (2026-06-24 ucrt)"
